@@ -1,5 +1,78 @@
 """Module with queries to be run in the app."""
 
+from dataclasses import dataclass, field
+from typing import ClassVar, List, Tuple
+
+from snowflake.snowpark.types import (
+    DataType,
+    IntegerType,
+    StringType,
+    StructField,
+    StructType,
+)
+
+
+@dataclass
+class Query:
+    """A proxy class for generating Sentry-related queries."""
+
+    file: str
+    output_schema: List[Tuple[str, DataType]] = field(default_factory=list)
+
+    _query_text: str = field(init=False)
+
+    _SCHEMA: ClassVar[str] = "SNOWFLAKE.ACCOUNT_USAGE"
+
+    def __post_init__(self):
+        """Dataclasses come with pre-packaged __init__ that calls this method."""
+        # Read from file, interpolate the SCHEMA variable
+        with open(self.file, "r") as file:
+            self._query_text = file.read().format(_SCHEMA=self._SCHEMA)
+
+    @property
+    def query_text(self):
+        """Return the interpolated query text for the Query object."""
+        return self._query_text
+
+    def to_sproc_handler(self):
+        """Return the parameters that can be passed to Snowpark's UDTFRegistration.register.
+
+        More info:
+        https://docs.snowflake.com/en/developer-guide/snowpark/reference/python/latest/api/snowflake.snowpark.stored_procedure.StoredProcedureRegistration.register
+        """
+        return {
+            "func": lambda _session: _session.sql(self.query_text),
+            "return_type": StructType([StructField(*i) for i in self.output_schema]),
+            "input_types": [],
+        }
+
+    def __str__(self):
+        """Return the query text of the Query."""
+        return self.query_text
+
+    def register_demo(self, session):
+        """Demo."""
+        my_sp = session.sproc.register(
+            **self.to_sproc_handler(),
+            packages=("snowflake-snowpark-python",),
+            name="DROPME",
+            is_permanent=True,
+            stage_location="@~",
+            replace=True,
+        )
+        return my_sp()
+
+
+TEST_NUM_FAILURES = Query(
+    file="./queries/num_failures.sql",
+    output_schema=[
+        ("user_name", StringType()),
+        ("error_message", StringType()),
+        ("num_of_failures", IntegerType()),
+    ],
+)
+
+
 _SCHEMA = "SNOWFLAKE.ACCOUNT_USAGE"
 
 NUM_FAILURES = f"""
@@ -381,3 +454,14 @@ from {_SCHEMA}.grants_to_users
 left join least_used_roles on user_name = grantee_name and role = role_name
 where deleted_on is null order by last_used, times_used, age desc;
 """
+
+if __name__ == "__main__":
+    import streamlit as st
+    from snowflake.snowpark import Session
+
+    session = Session.builder.configs(st.secrets["demo"]).create()
+
+    print(TEST_NUM_FAILURES.register_demo(session).collect())
+
+    print("Calling the sproc from sql")
+    print(session.sql("CALL DROPME();").collect())
