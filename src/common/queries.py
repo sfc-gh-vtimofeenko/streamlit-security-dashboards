@@ -1,8 +1,11 @@
 """Module with queries to be run in the app."""
 
+from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
-from typing import ClassVar, List, Tuple
+from typing import Callable, ClassVar, List, Tuple
 
+from snowflake.snowpark import Session
+from snowflake.snowpark.functions import col
 from snowflake.snowpark.types import (
     DataType,
     IntegerType,
@@ -13,26 +16,24 @@ from snowflake.snowpark.types import (
 
 
 @dataclass
-class Query:
+class Query(ABC):
     """A proxy class for generating Sentry-related queries."""
 
-    file: str
-    output_schema: List[Tuple[str, DataType]] = field(default_factory=list)
-
-    _query_text: str = field(init=False)
+    output_schema: List[Tuple[str, DataType]]
+    tech_name: str
 
     _SCHEMA: ClassVar[str] = "SNOWFLAKE.ACCOUNT_USAGE"
 
-    def __post_init__(self):
-        """Dataclasses come with pre-packaged __init__ that calls this method."""
-        # Read from file, interpolate the SCHEMA variable
-        with open(self.file, "r") as file:
-            self._query_text = file.read().format(_SCHEMA=self._SCHEMA)
+    @abstractmethod
+    def __str__(self):
+        """Return a string representation of the query."""
+        raise NotImplemented
 
     @property
-    def query_text(self):
-        """Return the interpolated query text for the Query object."""
-        return self._query_text
+    @abstractmethod
+    def sproc_func(self):
+        """Abstract function to be called as a stored procedure."""
+        raise NotImplemented
 
     def to_sproc_handler(self):
         """Return the parameters that can be passed to Snowpark's UDTFRegistration.register.
@@ -41,55 +42,101 @@ class Query:
         https://docs.snowflake.com/en/developer-guide/snowpark/reference/python/latest/api/snowflake.snowpark.stored_procedure.StoredProcedureRegistration.register
         """
         return {
-            "func": lambda _session: _session.sql(self.query_text),
+            "func": self.sproc_func,
             "return_type": StructType([StructField(*i) for i in self.output_schema]),
             "input_types": [],
         }
 
-    def __str__(self):
-        """Return the query text of the Query."""
-        return self.query_text
-
-    def register_demo(self, session):
+    def register_demo(self, _session: Session):
         """Demo."""
-        my_sp = session.sproc.register(
+        my_sp = _session.sproc.register(
             **self.to_sproc_handler(),
-            packages=("snowflake-snowpark-python",),
-            name="DROPME",
+            packages=[
+                "snowflake-snowpark-python",
+            ],
+            name=self.tech_name,
             is_permanent=True,
             stage_location="@~",
+            execute_as="caller",  # NOTE: required for SHOW GRANTS
             replace=True,
         )
         return my_sp()
 
 
-TEST_NUM_FAILURES = Query(
+@dataclass
+class SimpleQuery(Query):
+    """Simple queries that can be run from worksheets or Streamlit in Snowflake."""
+
+    file: str
+    _query_text: str = field(init=False)
+
+    def __post_init__(self):
+        """Dataclasses come with pre-packaged __init__ that calls this method."""
+        # Read from file, interpolate the SCHEMA variable
+        with open(self.file, "r") as file:
+            self._query_text = file.read().format(_SCHEMA=self._SCHEMA)
+
+    @property
+    def sproc_func(self):
+        """All simple queries are simply a call to sql method when calling as a stored procedure."""
+        return lambda _session: _session.sql(self.query_text)
+
+    @property
+    def query_text(self):
+        """Return the interpolated query text for the Query object."""
+        return self._query_text
+
+    def __str__(self):
+        """Return the query text of the Query."""
+        return self.query_text
+
+
+@dataclass
+class SprocOnlyQuery(Query):
+    """Query that can only be run as a stored procedure."""
+
+    _sproc_func: Callable
+
+    @property
+    def sproc_func(self):
+        """Return the function to be used in stored procedure.
+
+        Unlike SimpleQuery, this class allows setting an arbitrary callable as the sproc function.
+        """
+        return self._sproc_func
+
+    def __str__(self):
+        """Sproc-only queries will require turning them into anonymous stored procedures.
+
+        Not implemented yet.
+        """
+        raise NotImplemented  # No query text here
+
+
+NUM_FAILURES = SimpleQuery(
     file="./queries/num_failures.sql",
     output_schema=[
         ("user_name", StringType()),
         ("error_message", StringType()),
         ("num_of_failures", IntegerType()),
     ],
+    tech_name="NUM_FAILURES",
 )
 
+ACCOUNTADMIN_OWNERSHIP = SprocOnlyQuery(
+    output_schema=[
+        ("GRANTED_ON", StringType()),
+        ("NAME", StringType()),
+        ("OWNER", StringType()),  # Needed??
+    ],
+    _sproc_func=lambda _session: _session.sql("SHOW GRANTS TO ROLE accountadmin")
+    .filter(col('"privilege"') == "OWNERSHIP")
+    .filter(col('"granted_on"').in_(["USER", "ROLE"]))
+    .select(col('"granted_on"'), col('"name"'), col('"grantee_name"').as_("OWNER")),
+    tech_name="ACCOUNTADMIN_OWNERSHIP",
+)
 
 _SCHEMA = "SNOWFLAKE.ACCOUNT_USAGE"
-
-NUM_FAILURES = f"""
-select
-    user_name,
-    error_message,
-    count(*) num_of_failures
-from
-    {_SCHEMA}.login_history
-where
-    is_success = 'NO'
-group by
-    user_name,
-    error_message
-order by
-    num_of_failures desc;
-"""
 
 AUTH_BY_METHOD = f"""
 select
@@ -445,7 +492,6 @@ select grantee_name as user, count(*) role_count from {_SCHEMA}.grants_to_users 
 select round(avg(role_count),1) from role_grants_per_user;
 """
 
-
 LEAST_USED_ROLE_GRANTS = f"""
 with least_used_roles (user_name, role_name, last_used, times_used) as
 (select user_name, role_name, max(end_time), count(*) from {_SCHEMA}.query_history group by user_name, role_name order by user_name, role_name)
@@ -461,7 +507,14 @@ if __name__ == "__main__":
 
     session = Session.builder.configs(st.secrets["demo"]).create()
 
-    print(TEST_NUM_FAILURES.register_demo(session).collect())
+    NUM_FAILURES.register_demo(session)
 
     print("Calling the sproc from sql")
-    print(session.sql("CALL DROPME();").collect())
+    print(session.sql("CALL NUM_FAILURES();").collect())
+
+    print("ACCOUNTADMIN ownership")
+
+    ACCOUNTADMIN_OWNERSHIP.register_demo(session)
+
+    print("Calling the sproc from sql")
+    print(session.sql("CALL ACCOUNTADMIN_OWNERSHIP();").collect())
